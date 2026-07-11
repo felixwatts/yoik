@@ -166,7 +166,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
           <button type="submit">Yoik!</button>
         </div>
         <br />
-        <div class="kind-group">
+        <div class="radio-group">
           <input type="radio" name="kind" id="kind-film" value="film" />
           <label for="kind-film">🎬 Film</label>
 
