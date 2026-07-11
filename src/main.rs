@@ -1,15 +1,18 @@
 use axum::{
-    Form,
-    Router,
+    Form, Router,
+    extract::State,
     response::{Html, Redirect},
     routing::{get, post},
 };
 use serde::Deserialize;
-use tokio::process::Command;
 use std::process::Stdio;
+use tokio::process::Command;
 
-const AUDIO_OUTPUT_DIR: &str = "/home/felix/data/audio/music";
-const VIDEO_OUTPUT_DIR: &str = "/home/felix/data/video/youtube";
+#[derive(Clone)]
+struct AppState {
+    audio_dir: String,
+    video_dir: String,
+}
 
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -153,9 +156,9 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn rip_audio(Form(form): Form<RipForm>) -> Redirect {
+async fn rip_audio(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     if is_valid_youtube_url(&form.url) {
-        let output = format!("{}/%(title)s.%(ext)s", AUDIO_OUTPUT_DIR);
+        let output = format!("{}/%(title)s.%(ext)s", state.audio_dir);
         spawn_yt_dlp(vec![
             "-x".into(),
             "--audio-format".into(),
@@ -169,9 +172,9 @@ async fn rip_audio(Form(form): Form<RipForm>) -> Redirect {
     Redirect::to("/")
 }
 
-async fn rip_video(Form(form): Form<RipForm>) -> Redirect {
+async fn rip_video(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     if is_valid_youtube_url(&form.url) {
-        let output = format!("{}/%(title)s.%(ext)s", VIDEO_OUTPUT_DIR);
+        let output = format!("{}/%(title)s.%(ext)s", state.video_dir);
         spawn_yt_dlp(vec![
             "-f".into(),
             "bestvideo+bestaudio/best".into(),
@@ -188,15 +191,26 @@ async fn rip_video(Form(form): Form<RipForm>) -> Redirect {
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+
     let port: u16 = std::env::var("YOIK_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
 
+    let audio_dir = std::env::var("YOIK_AUDIO_DIR")
+        .unwrap_or_else(|_| "/home/felix/data/audio/music".into());
+
+    let video_dir = std::env::var("YOIK_VIDEO_DIR")
+        .unwrap_or_else(|_| "/home/felix/data/video/youtube".into());
+
+    let state = AppState { audio_dir, video_dir };
+
     let app = Router::new()
         .route("/", get(index))
         .route("/rip/audio", post(rip_audio))
-        .route("/rip/video", post(rip_video));
+        .route("/rip/video", post(rip_video))
+        .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
