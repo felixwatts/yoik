@@ -160,7 +160,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <h1>Yoik</h1>
 
     <section>
-      <form method="post" action="/rip">
+      <form method="post" action="/yoik">
         <div class="radio-group">
           <input type="radio" name="kind" id="kind-music" value="music" />
           <label for="kind-music">🎵 Music</label>
@@ -176,7 +176,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
         <div class="url-row">
           <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
-          <button type="submit">Rip</button>
+          <button type="submit">Yoik!</button>
         </div>
       </form>
     </section>
@@ -258,6 +258,7 @@ fn spawn_aria2c(label: &'static str, url: String, output_dir: String) {
             .arg("--dir")
             .arg(&output_dir)
             .arg("--continue=true")
+            .arg("--seed-time=60")
             .arg(&url)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -284,7 +285,7 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn rip(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
+async fn yoik(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     let label = form.kind.label();
     let dir = form.kind.output_dir(&state).to_owned();
 
@@ -351,7 +352,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/rip", post(rip))
+        .route("/yoik", post(yoik))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
