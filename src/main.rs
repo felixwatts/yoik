@@ -4,6 +4,7 @@ use axum::{
     response::{Html, Redirect},
     routing::{get, post},
 };
+use log::{error, info, warn};
 use serde::Deserialize;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -141,14 +142,29 @@ fn is_valid_youtube_url(raw: &str) -> bool {
     )
 }
 
-fn spawn_yt_dlp(args: Vec<String>) {
+fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
+    info!("spawning yt-dlp for {label}: {url}");
     tokio::spawn(async move {
-        let _ = Command::new("yt-dlp")
+        match Command::new("yt-dlp")
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .await;
+            .await
+        {
+            Ok(status) if status.success() => {
+                info!("yt-dlp {label} completed successfully: {url}");
+            }
+            Ok(status) => {
+                error!(
+                    "yt-dlp {label} failed (exit code {}): {url}",
+                    status.code().map_or(-1, |c| c),
+                );
+            }
+            Err(e) => {
+                error!("failed to spawn yt-dlp for {label}: {e}");
+            }
+        }
     });
 }
 
@@ -159,7 +175,7 @@ async fn index() -> Html<&'static str> {
 async fn rip_audio(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     if is_valid_youtube_url(&form.url) {
         let output = format!("{}/%(title)s.%(ext)s", state.audio_dir);
-        spawn_yt_dlp(vec![
+        spawn_yt_dlp("audio", form.url.clone(), vec![
             "-x".into(),
             "--audio-format".into(),
             "mp3".into(),
@@ -168,6 +184,8 @@ async fn rip_audio(State(state): State<AppState>, Form(form): Form<RipForm>) -> 
             output,
             form.url,
         ]);
+    } else {
+        warn!("rejected invalid URL for audio rip: {:?}", form.url);
     }
     Redirect::to("/")
 }
@@ -175,7 +193,7 @@ async fn rip_audio(State(state): State<AppState>, Form(form): Form<RipForm>) -> 
 async fn rip_video(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     if is_valid_youtube_url(&form.url) {
         let output = format!("{}/%(title)s.%(ext)s", state.video_dir);
-        spawn_yt_dlp(vec![
+        spawn_yt_dlp("video", form.url.clone(), vec![
             "-f".into(),
             "bestvideo+bestaudio/best".into(),
             "--merge-output-format".into(),
@@ -185,6 +203,8 @@ async fn rip_video(State(state): State<AppState>, Form(form): Form<RipForm>) -> 
             output,
             form.url,
         ]);
+    } else {
+        warn!("rejected invalid URL for video rip: {:?}", form.url);
     }
     Redirect::to("/")
 }
@@ -192,6 +212,8 @@ async fn rip_video(State(state): State<AppState>, Form(form): Form<RipForm>) -> 
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let port: u16 = std::env::var("YOIK_PORT")
         .ok()
@@ -204,6 +226,9 @@ async fn main() {
     let video_dir = std::env::var("YOIK_VIDEO_DIR")
         .unwrap_or_else(|_| "/home/felix/data/video/youtube".into());
 
+    info!("audio output dir: {audio_dir}");
+    info!("video output dir: {video_dir}");
+
     let state = AppState { audio_dir, video_dir };
 
     let app = Router::new()
@@ -214,6 +239,6 @@ async fn main() {
 
     let addr = format!("0.0.0.0:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    eprintln!("Listening on http://{addr}");
+    info!("listening on http://{addr}");
     axum::serve(listener, app).await.unwrap();
 }
