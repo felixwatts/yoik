@@ -100,7 +100,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <section>
       <h2>Rip Audio</h2>
       <form method="post" action="/rip/audio">
-        <input type="text" name="url" placeholder="YouTube URL" required />
+        <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
         <button type="submit">Rip</button>
       </form>
     </section>
@@ -108,7 +108,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <section>
       <h2>Rip Video</h2>
       <form method="post" action="/rip/video">
-        <input type="text" name="url" placeholder="YouTube URL" required />
+        <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
         <button type="submit">Rip</button>
       </form>
     </section>
@@ -142,13 +142,28 @@ fn is_valid_youtube_url(raw: &str) -> bool {
     )
 }
 
+fn is_aria2c_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // magnet URIs don't have a host and don't parse as standard URLs
+    if trimmed.to_ascii_lowercase().starts_with("magnet:") {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https" | "ftp")
+}
+
 fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
     info!("spawning yt-dlp for {label}: {url}");
     tokio::spawn(async move {
         match Command::new("yt-dlp")
             .args(&args)
-            // .stdout(Stdio::null())
-            // .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .await
         {
@@ -163,6 +178,35 @@ fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
             }
             Err(e) => {
                 error!("failed to spawn yt-dlp for {label}: {e}");
+            }
+        }
+    });
+}
+
+fn spawn_aria2c(label: &'static str, url: String, output_dir: String) {
+    info!("spawning aria2c for {label}: {url}");
+    tokio::spawn(async move {
+        match Command::new("aria2c")
+            .arg("--dir")
+            .arg(&output_dir)
+            .arg("--continue=true")
+            .arg(&url)
+            // .stdout(Stdio::null())
+            // .stderr(Stdio::null())
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                info!("aria2c {label} completed successfully: {url}");
+            }
+            Ok(status) => {
+                error!(
+                    "aria2c {label} failed (exit code {}): {url}",
+                    status.code().map_or(-1, |c| c),
+                );
+            }
+            Err(e) => {
+                error!("failed to spawn aria2c for {label}: {e}");
             }
         }
     });
@@ -184,8 +228,10 @@ async fn rip_audio(State(state): State<AppState>, Form(form): Form<RipForm>) -> 
             output,
             form.url,
         ]);
+    } else if is_aria2c_url(&form.url) {
+        spawn_aria2c("audio", form.url, state.audio_dir);
     } else {
-        warn!("rejected invalid URL for audio rip: {:?}", form.url);
+        warn!("rejected unsupported URL for audio rip: {:?}", form.url);
     }
     Redirect::to("/")
 }
@@ -203,8 +249,10 @@ async fn rip_video(State(state): State<AppState>, Form(form): Form<RipForm>) -> 
             output,
             form.url,
         ]);
+    } else if is_aria2c_url(&form.url) {
+        spawn_aria2c("video", form.url, state.video_dir);
     } else {
-        warn!("rejected invalid URL for video rip: {:?}", form.url);
+        warn!("rejected unsupported URL for video rip: {:?}", form.url);
     }
     Redirect::to("/")
 }
