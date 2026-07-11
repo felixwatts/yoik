@@ -147,8 +147,8 @@ fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
     tokio::spawn(async move {
         match Command::new("yt-dlp")
             .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // .stdout(Stdio::null())
+            // .stderr(Stdio::null())
             .status()
             .await
         {
