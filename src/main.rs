@@ -161,22 +161,25 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 
     <section>
       <form method="post" action="/yoik">
-        <div class="radio-group">
+        <div class="url-row">
+          <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
+          <button type="submit">Yoik!</button>
+        </div>
+        <br />
+        <div class="kind-group">
+          <input type="radio" name="kind" id="kind-film" value="film" />
+          <label for="kind-film">🎬 Film</label>
+
+          <input type="radio" name="kind" id="kind-series" value="series" />
+          <label for="kind-series">📺 Series</label>
+
           <input type="radio" name="kind" id="kind-music" value="music" />
           <label for="kind-music">🎵 Music</label>
 
           <input type="radio" name="kind" id="kind-audiobook" value="audiobook" />
           <label for="kind-audiobook">📖 Audiobook</label>
 
-          <input type="radio" name="kind" id="kind-film" value="film" checked />
-          <label for="kind-film">🎬 Film</label>
 
-          <input type="radio" name="kind" id="kind-series" value="series" />
-          <label for="kind-series">📺 Series</label>
-        </div>
-        <div class="url-row">
-          <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
-          <button type="submit">Yoik!</button>
         </div>
       </form>
     </section>
