@@ -11,8 +11,43 @@ use tokio::process::Command;
 
 #[derive(Clone)]
 struct AppState {
-    audio_dir: String,
-    video_dir: String,
+    music_dir: String,
+    audiobook_dir: String,
+    film_dir: String,
+    series_dir: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum MediaKind {
+    Music,
+    Audiobook,
+    Film,
+    Series,
+}
+
+impl MediaKind {
+    fn output_dir<'a>(&self, state: &'a AppState) -> &'a str {
+        match self {
+            MediaKind::Music => &state.music_dir,
+            MediaKind::Audiobook => &state.audiobook_dir,
+            MediaKind::Film => &state.film_dir,
+            MediaKind::Series => &state.series_dir,
+        }
+    }
+
+    fn is_audio(&self) -> bool {
+        matches!(self, MediaKind::Music | MediaKind::Audiobook)
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            MediaKind::Music => "music",
+            MediaKind::Audiobook => "audiobook",
+            MediaKind::Film => "film",
+            MediaKind::Series => "series",
+        }
+    }
 }
 
 const INDEX_HTML: &str = r#"<!DOCTYPE html>
@@ -35,7 +70,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     main {
       width: 100%;
-      max-width: 520px;
+      max-width: 540px;
       display: flex;
       flex-direction: column;
       gap: 2rem;
@@ -53,16 +88,43 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
       padding: 1.5rem;
       display: flex;
       flex-direction: column;
-      gap: 1rem;
+      gap: 1.25rem;
     }
-    h2 {
-      font-size: 1rem;
-      font-weight: 600;
+    .radio-group {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+    .radio-group input[type="radio"] {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .radio-group label {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35em;
+      padding: 0.45rem 0.9rem;
+      border: 1px solid #444;
+      border-radius: 999px;
+      cursor: pointer;
+      font-size: 0.9rem;
       color: #aaa;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
+      background: #111;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+      user-select: none;
     }
-    form {
+    .radio-group input[type="radio"]:checked + label {
+      border-color: #e00;
+      color: #fff;
+      background: #2a0000;
+    }
+    .radio-group label:hover {
+      border-color: #888;
+      color: #e8e8e8;
+    }
+    .url-row {
       display: flex;
       gap: 0.5rem;
     }
@@ -98,18 +160,24 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <h1>Yoik</h1>
 
     <section>
-      <h2>Rip Audio</h2>
-      <form method="post" action="/rip/audio">
-        <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
-        <button type="submit">Rip</button>
-      </form>
-    </section>
+      <form method="post" action="/rip">
+        <div class="radio-group">
+          <input type="radio" name="kind" id="kind-music" value="music" />
+          <label for="kind-music">🎵 Music</label>
 
-    <section>
-      <h2>Rip Video</h2>
-      <form method="post" action="/rip/video">
-        <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
-        <button type="submit">Rip</button>
+          <input type="radio" name="kind" id="kind-audiobook" value="audiobook" />
+          <label for="kind-audiobook">📖 Audiobook</label>
+
+          <input type="radio" name="kind" id="kind-film" value="film" checked />
+          <label for="kind-film">🎬 Film</label>
+
+          <input type="radio" name="kind" id="kind-series" value="series" />
+          <label for="kind-series">📺 Series</label>
+        </div>
+        <div class="url-row">
+          <input type="text" name="url" placeholder="YouTube URL or magnet / ftp / http link" required />
+          <button type="submit">Rip</button>
+        </div>
       </form>
     </section>
   </main>
@@ -119,6 +187,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
 #[derive(Deserialize)]
 struct RipForm {
     url: String,
+    kind: MediaKind,
 }
 
 fn is_valid_youtube_url(raw: &str) -> bool {
@@ -147,7 +216,6 @@ fn is_aria2c_url(raw: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    // magnet URIs don't have a host and don't parse as standard URLs
     if trimmed.to_ascii_lowercase().starts_with("magnet:") {
         return true;
     }
@@ -191,8 +259,8 @@ fn spawn_aria2c(label: &'static str, url: String, output_dir: String) {
             .arg(&output_dir)
             .arg("--continue=true")
             .arg(&url)
-            // .stdout(Stdio::null())
-            // .stderr(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .await
         {
@@ -216,44 +284,41 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn rip_audio(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
-    if is_valid_youtube_url(&form.url) {
-        let output = format!("{}/%(title)s.%(ext)s", state.audio_dir);
-        spawn_yt_dlp("audio", form.url.clone(), vec![
-            "-x".into(),
-            "--audio-format".into(),
-            "mp3".into(),
-            "--no-playlist".into(),
-            "-o".into(),
-            output,
-            form.url,
-        ]);
-    } else if is_aria2c_url(&form.url) {
-        spawn_aria2c("audio", form.url, state.audio_dir);
-    } else {
-        warn!("rejected unsupported URL for audio rip: {:?}", form.url);
-    }
-    Redirect::to("/")
-}
+async fn rip(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
+    let label = form.kind.label();
+    let dir = form.kind.output_dir(&state).to_owned();
 
-async fn rip_video(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     if is_valid_youtube_url(&form.url) {
-        let output = format!("{}/%(title)s.%(ext)s", state.video_dir);
-        spawn_yt_dlp("video", form.url.clone(), vec![
-            "-f".into(),
-            "bestvideo+bestaudio/best".into(),
-            "--merge-output-format".into(),
-            "mp4".into(),
-            "--no-playlist".into(),
-            "-o".into(),
-            output,
-            form.url,
-        ]);
+        if form.kind.is_audio() {
+            let output = format!("{dir}/%(title)s.%(ext)s");
+            spawn_yt_dlp(label, form.url.clone(), vec![
+                "-x".into(),
+                "--audio-format".into(),
+                "mp3".into(),
+                "--no-playlist".into(),
+                "-o".into(),
+                output,
+                form.url,
+            ]);
+        } else {
+            let output = format!("{dir}/%(title)s.%(ext)s");
+            spawn_yt_dlp(label, form.url.clone(), vec![
+                "-f".into(),
+                "bestvideo+bestaudio/best".into(),
+                "--merge-output-format".into(),
+                "mp4".into(),
+                "--no-playlist".into(),
+                "-o".into(),
+                output,
+                form.url,
+            ]);
+        }
     } else if is_aria2c_url(&form.url) {
-        spawn_aria2c("video", form.url, state.video_dir);
+        spawn_aria2c(label, form.url, dir);
     } else {
-        warn!("rejected unsupported URL for video rip: {:?}", form.url);
+        warn!("rejected unsupported URL for {label} rip: {:?}", form.url);
     }
+
     Redirect::to("/")
 }
 
@@ -268,21 +333,25 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
 
-    let audio_dir = std::env::var("YOIK_AUDIO_DIR")
+    let music_dir = std::env::var("YOIK_MUSIC_DIR")
         .unwrap_or_else(|_| "/home/felix/data/audio/music".into());
+    let audiobook_dir = std::env::var("YOIK_AUDIOBOOK_DIR")
+        .unwrap_or_else(|_| "/home/felix/data/audio/audiobooks".into());
+    let film_dir = std::env::var("YOIK_FILM_DIR")
+        .unwrap_or_else(|_| "/home/felix/data/video/films".into());
+    let series_dir = std::env::var("YOIK_SERIES_DIR")
+        .unwrap_or_else(|_| "/home/felix/data/video/series".into());
 
-    let video_dir = std::env::var("YOIK_VIDEO_DIR")
-        .unwrap_or_else(|_| "/home/felix/data/video/youtube".into());
+    info!("music dir:     {music_dir}");
+    info!("audiobook dir: {audiobook_dir}");
+    info!("film dir:      {film_dir}");
+    info!("series dir:    {series_dir}");
 
-    info!("audio output dir: {audio_dir}");
-    info!("video output dir: {video_dir}");
-
-    let state = AppState { audio_dir, video_dir };
+    let state = AppState { music_dir, audiobook_dir, film_dir, series_dir };
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/rip/audio", post(rip_audio))
-        .route("/rip/video", post(rip_video))
+        .route("/rip", post(rip))
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
