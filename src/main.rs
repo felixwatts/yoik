@@ -1,7 +1,8 @@
 use axum::{
     Form, Router,
     extract::State,
-    response::{Html, Redirect},
+    http::header,
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use log::{error, info, warn};
@@ -288,6 +289,11 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
+async fn favicon() -> Response {
+    static BYTES: &[u8] = include_bytes!("../favicon.ico");
+    ([(header::CONTENT_TYPE, "image/x-icon")], BYTES).into_response()
+}
+
 async fn yoik(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     let label = form.kind.label();
     let dir = form.kind.output_dir(&state).to_owned();
@@ -355,6 +361,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
         .route("/yoik", post(yoik))
         .with_state(state);
 
