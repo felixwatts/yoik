@@ -242,15 +242,21 @@ fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
         {
             Ok(status) if status.success() => {
                 info!("yt-dlp {label} completed successfully: {url}");
+
+                post_to_matrix(format!("Downloaded {label}"));
             }
             Ok(status) => {
                 error!(
                     "yt-dlp {label} failed (exit code {}): {url}",
                     status.code().map_or(-1, |c| c),
                 );
+
+                post_to_matrix(format!("Failed to download {label}: exit code {}", status.code().map_or(-1, |c| c)));
             }
             Err(e) => {
                 error!("failed to spawn yt-dlp for {label}: {e}");
+
+                post_to_matrix(format!("Failed to download {label}: {e}"));
             }
         }
     });
@@ -272,15 +278,50 @@ fn spawn_aria2c(label: &'static str, url: String, output_dir: String) {
         {
             Ok(status) if status.success() => {
                 info!("aria2c {label} completed successfully: {url}");
+
+                post_to_matrix(format!("Downloaded {label} to {output_dir}"));
             }
             Ok(status) => {
                 error!(
                     "aria2c {label} failed (exit code {}): {url}",
                     status.code().map_or(-1, |c| c),
                 );
+
+                post_to_matrix(format!("Failed to download {label} to {output_dir}: exit code {}", status.code().map_or(-1, |c| c)));
             }
             Err(e) => {
                 error!("failed to spawn aria2c for {label}: {e}");
+
+                post_to_matrix(format!("Failed to download {label} to {output_dir}: {e}"));
+            }
+        }
+    });
+}
+
+fn post_to_matrix(msg: String) {
+    info!("posting to matrix: {msg}");
+    tokio::spawn(async move {
+        match Command::new("/home/felix/.cargo/bin/t2")
+            .arg("pub")
+            .arg("string/matrix")
+            .arg(&msg)
+            .arg("tcp:10.0.0.2:9999")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                info!("matrix post completed successfully: {msg}");
+            }
+            Ok(status) => {
+                error!(
+                    "matrix post failed (exit code {}): {msg}",
+                    status.code().map_or(-1, |c| c),
+                );
+            }
+            Err(e) => {
+                error!("failed to spawn matrix post: {e}");
             }
         }
     });
