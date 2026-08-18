@@ -7,11 +7,16 @@ use axum::{
 };
 use log::{error, info, warn};
 use serde::Deserialize;
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::process::Command;
+
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct AppState {
+    download_dir: String,
     music_dir: String,
     audiobook_dir: String,
     film_dir: String,
@@ -230,9 +235,96 @@ fn is_aria2c_url(raw: &str) -> bool {
     matches!(parsed.scheme(), "http" | "https" | "ftp")
 }
 
-fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
+fn new_staging_dir(download_dir: &str) -> String {
+    let n = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{download_dir}/{nanos}-{n}")
+}
+
+async fn prepare_staging(download_dir: &str) -> std::io::Result<String> {
+    let staging = new_staging_dir(download_dir);
+    tokio::fs::create_dir_all(&staging).await?;
+    Ok(staging)
+}
+
+async fn move_staging_to_dest(staging_dir: &str, dest_dir: &str) -> Result<(), String> {
+    tokio::fs::create_dir_all(dest_dir)
+        .await
+        .map_err(|e| format!("failed to create destination {dest_dir}: {e}"))?;
+
+    let mut entries = tokio::fs::read_dir(staging_dir)
+        .await
+        .map_err(|e| format!("failed to read staging dir {staging_dir}: {e}"))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("failed to read staging dir {staging_dir}: {e}"))?
+    {
+        let src = entry.path();
+        let dest = Path::new(dest_dir).join(entry.file_name());
+        let status = Command::new("mv")
+            .arg(&src)
+            .arg(&dest)
+            .status()
+            .await
+            .map_err(|e| format!("failed to spawn mv: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "mv {} {} failed with exit code {}",
+                src.display(),
+                dest.display(),
+                status.code().map_or(-1, |c| c),
+            ));
+        }
+    }
+
+    tokio::fs::remove_dir_all(staging_dir)
+        .await
+        .map_err(|e| format!("failed to remove staging dir {staging_dir}: {e}"))?;
+    Ok(())
+}
+
+async fn finish_download(label: &'static str, url: &str, staging: &str, dest_dir: &str) {
+    match move_staging_to_dest(staging, dest_dir).await {
+        Ok(()) => {
+            info!("{label} completed successfully: {url} -> {dest_dir}");
+            post_to_matrix(format!("Downloaded {label} to {dest_dir}"));
+        }
+        Err(e) => {
+            error!("{label} downloaded but failed to move from {staging} to {dest_dir}: {e}");
+            post_to_matrix(format!(
+                "Downloaded {label} but failed to move to {dest_dir}: {e}"
+            ));
+        }
+    }
+}
+
+fn spawn_yt_dlp(
+    label: &'static str,
+    url: String,
+    mut args: Vec<String>,
+    download_dir: String,
+    dest_dir: String,
+) {
     info!("spawning yt-dlp for {label}: {url}");
     tokio::spawn(async move {
+        let staging = match prepare_staging(&download_dir).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("failed to create staging dir in {download_dir}: {e}");
+                post_to_matrix(format!("Failed to download {label}: {e}"));
+                return;
+            }
+        };
+
+        args.push("-o".into());
+        args.push(format!("{staging}/%(title)s.%(ext)s"));
+        args.push(url.clone());
+
         match Command::new("yt-dlp")
             .args(&args)
             .stdout(Stdio::null())
@@ -241,13 +333,11 @@ fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
             .await
         {
             Ok(status) if status.success() => {
-                info!("yt-dlp {label} completed successfully: {url}");
-
-                post_to_matrix(format!("Downloaded {label}"));
+                finish_download(label, &url, &staging, &dest_dir).await;
             }
             Ok(status) => {
                 error!(
-                    "yt-dlp {label} failed (exit code {}): {url}",
+                    "yt-dlp {label} failed (exit code {}): {url} (staging {staging})",
                     status.code().map_or(-1, |c| c),
                 );
 
@@ -262,12 +352,21 @@ fn spawn_yt_dlp(label: &'static str, url: String, args: Vec<String>) {
     });
 }
 
-fn spawn_aria2c(label: &'static str, url: String, output_dir: String) {
+fn spawn_aria2c(label: &'static str, url: String, download_dir: String, dest_dir: String) {
     info!("spawning aria2c for {label}: {url}");
     tokio::spawn(async move {
+        let staging = match prepare_staging(&download_dir).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("failed to create staging dir in {download_dir}: {e}");
+                post_to_matrix(format!("Failed to download {label}: {e}"));
+                return;
+            }
+        };
+
         match Command::new("aria2c")
             .arg("--dir")
-            .arg(&output_dir)
+            .arg(&staging)
             .arg("--continue=true")
             .arg("--seed-time=60")
             .arg(&url)
@@ -277,22 +376,20 @@ fn spawn_aria2c(label: &'static str, url: String, output_dir: String) {
             .await
         {
             Ok(status) if status.success() => {
-                info!("aria2c {label} completed successfully: {url}");
-
-                post_to_matrix(format!("Downloaded {label} to {output_dir}"));
+                finish_download(label, &url, &staging, &dest_dir).await;
             }
             Ok(status) => {
                 error!(
-                    "aria2c {label} failed (exit code {}): {url}",
+                    "aria2c {label} failed (exit code {}): {url} (staging {staging})",
                     status.code().map_or(-1, |c| c),
                 );
 
-                post_to_matrix(format!("Failed to download {label} to {output_dir}: exit code {}", status.code().map_or(-1, |c| c)));
+                post_to_matrix(format!("Failed to download {label} to {dest_dir}: exit code {}", status.code().map_or(-1, |c| c)));
             }
             Err(e) => {
                 error!("failed to spawn aria2c for {label}: {e}");
 
-                post_to_matrix(format!("Failed to download {label} to {output_dir}: {e}"));
+                post_to_matrix(format!("Failed to download {label} to {dest_dir}: {e}"));
             }
         }
     });
@@ -339,34 +436,39 @@ async fn favicon() -> Response {
 async fn yoik(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     let label = form.kind.label();
     let dir = form.kind.output_dir(&state).to_owned();
+    let download_dir = state.download_dir.clone();
 
     if is_valid_youtube_url(&form.url) {
         if form.kind.is_audio() {
-            let output = format!("{dir}/%(title)s.%(ext)s");
-            spawn_yt_dlp(label, form.url.clone(), vec![
-                "-x".into(),
-                "--audio-format".into(),
-                "mp3".into(),
-                "--no-playlist".into(),
-                "-o".into(),
-                output,
+            spawn_yt_dlp(
+                label,
                 form.url,
-            ]);
+                vec![
+                    "-x".into(),
+                    "--audio-format".into(),
+                    "mp3".into(),
+                    "--no-playlist".into(),
+                ],
+                download_dir,
+                dir,
+            );
         } else {
-            let output = format!("{dir}/%(title)s.%(ext)s");
-            spawn_yt_dlp(label, form.url.clone(), vec![
-                "-f".into(),
-                "bestvideo+bestaudio/best".into(),
-                "--merge-output-format".into(),
-                "mp4".into(),
-                "--no-playlist".into(),
-                "-o".into(),
-                output,
+            spawn_yt_dlp(
+                label,
                 form.url,
-            ]);
+                vec![
+                    "-f".into(),
+                    "bestvideo+bestaudio/best".into(),
+                    "--merge-output-format".into(),
+                    "mp4".into(),
+                    "--no-playlist".into(),
+                ],
+                download_dir,
+                dir,
+            );
         }
     } else if is_aria2c_url(&form.url) {
-        spawn_aria2c(label, form.url, dir);
+        spawn_aria2c(label, form.url, download_dir, dir);
     } else {
         warn!("rejected unsupported URL for {label} rip: {:?}", form.url);
     }
@@ -385,6 +487,8 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3000);
 
+    let download_dir = std::env::var("YOIK_DOWNLOAD_DIR")
+        .unwrap_or_else(|_| "/home/felix/data/download".into());
     let music_dir = std::env::var("YOIK_MUSIC_DIR")
         .unwrap_or_else(|_| "/home/felix/data/audio/music".into());
     let audiobook_dir = std::env::var("YOIK_AUDIOBOOK_DIR")
@@ -394,12 +498,19 @@ async fn main() {
     let series_dir = std::env::var("YOIK_SERIES_DIR")
         .unwrap_or_else(|_| "/home/felix/data/video/series".into());
 
+    info!("download dir:  {download_dir}");
     info!("music dir:     {music_dir}");
     info!("audiobook dir: {audiobook_dir}");
     info!("film dir:      {film_dir}");
     info!("series dir:    {series_dir}");
 
-    let state = AppState { music_dir, audiobook_dir, film_dir, series_dir };
+    let state = AppState {
+        download_dir,
+        music_dir,
+        audiobook_dir,
+        film_dir,
+        series_dir,
+    };
 
     let app = Router::new()
         .route("/", get(index))
