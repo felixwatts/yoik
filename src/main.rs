@@ -519,13 +519,48 @@ fn new_staging_dir(download_dir: &str) -> String {
     format!("{download_dir}/{nanos}-{n}")
 }
 
+const STDERR_TAIL_LINES: usize = 20;
+const STDERR_TAIL_MAX_BYTES: usize = 2048;
+
+async fn run_command(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped()).output().await
+}
+
+fn stderr_tail(output: &std::process::Output) -> String {
+    let text = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let start = lines.len().saturating_sub(STDERR_TAIL_LINES);
+    let tail = lines[start..].join("\n");
+    if tail.len() <= STDERR_TAIL_MAX_BYTES {
+        return tail;
+    }
+    let mut start_byte = tail.len() - STDERR_TAIL_MAX_BYTES;
+    while start_byte > 0 && !tail.is_char_boundary(start_byte) {
+        start_byte -= 1;
+    }
+    format!("…{}", &tail[start_byte..])
+}
+
+fn with_stderr_tail(msg: String, output: &std::process::Output) -> String {
+    let stderr = stderr_tail(output);
+    if stderr.is_empty() {
+        msg
+    } else {
+        format!("{msg}\n{stderr}")
+    }
+}
+
 async fn prepare_staging(download_dir: &str) -> std::io::Result<String> {
     let staging = new_staging_dir(download_dir);
     tokio::fs::create_dir_all(&staging).await?;
     Ok(staging)
 }
 
-async fn move_staging_to_dest(staging_dir: &str, dest_dir: &str) -> Result<(), String> {
+async fn move_staging_to_dest(staging_dir: &str, dest_dir: &str) -> Result<Vec<String>, String> {
     tokio::fs::create_dir_all(dest_dir)
         .await
         .map_err(|e| format!("failed to create destination {dest_dir}: {e}"))?;
@@ -534,40 +569,52 @@ async fn move_staging_to_dest(staging_dir: &str, dest_dir: &str) -> Result<(), S
         .await
         .map_err(|e| format!("failed to read staging dir {staging_dir}: {e}"))?;
 
+    let mut names = Vec::new();
     while let Some(entry) = entries
         .next_entry()
         .await
         .map_err(|e| format!("failed to read staging dir {staging_dir}: {e}"))?
     {
+        let name = entry.file_name().to_string_lossy().into_owned();
         let src = entry.path();
         let dest = Path::new(dest_dir).join(entry.file_name());
-        let status = Command::new("mv")
-            .arg(&src)
-            .arg(&dest)
-            .status()
+        let output = run_command(Command::new("mv").arg(&src).arg(&dest))
             .await
             .map_err(|e| format!("failed to spawn mv: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "mv {} {} failed with exit code {}",
-                src.display(),
-                dest.display(),
-                status.code().map_or(-1, |c| c),
+        if !output.status.success() {
+            return Err(with_stderr_tail(
+                format!(
+                    "mv {} {} failed with exit code {}",
+                    src.display(),
+                    dest.display(),
+                    output.status.code().map_or(-1, |c| c),
+                ),
+                &output,
             ));
         }
+        names.push(name);
     }
 
     tokio::fs::remove_dir_all(staging_dir)
         .await
         .map_err(|e| format!("failed to remove staging dir {staging_dir}: {e}"))?;
-    Ok(())
+    Ok(names)
+}
+
+fn downloaded_name(names: &[String]) -> String {
+    if names.is_empty() {
+        "unknown".into()
+    } else {
+        names.join(", ")
+    }
 }
 
 async fn finish_download(label: &'static str, url: &str, staging: &str, dest_dir: &str) {
     match move_staging_to_dest(staging, dest_dir).await {
-        Ok(()) => {
-            info!("{label} completed successfully: {url} -> {dest_dir}");
-            post_to_matrix(format!("Downloaded {label} to {dest_dir}"));
+        Ok(names) => {
+            let name = downloaded_name(&names);
+            info!("{label} completed successfully: {name} ({url} -> {dest_dir})");
+            post_to_matrix(format!("Downloaded {label}: {name}"));
         }
         Err(e) => {
             error!("{label} downloaded but failed to move from {staging} to {dest_dir}: {e}");
@@ -600,23 +647,26 @@ fn spawn_yt_dlp(
         args.push(format!("{staging}/%(title)s.%(ext)s"));
         args.push(url.clone());
 
-        match Command::new("yt-dlp")
-            .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-        {
-            Ok(status) if status.success() => {
+        match run_command(Command::new("yt-dlp").args(&args)).await {
+            Ok(output) if output.status.success() => {
                 finish_download(label, &url, &staging, &dest_dir).await;
             }
-            Ok(status) => {
+            Ok(output) => {
+                let code = output.status.code().map_or(-1, |c| c);
                 error!(
-                    "yt-dlp {label} failed (exit code {}): {url} (staging {staging})",
-                    status.code().map_or(-1, |c| c),
+                    "{}",
+                    with_stderr_tail(
+                        format!(
+                            "yt-dlp {label} failed (exit code {code}): {url} (staging {staging})"
+                        ),
+                        &output,
+                    )
                 );
 
-                post_to_matrix(format!("Failed to download {label}: exit code {}", status.code().map_or(-1, |c| c)));
+                post_to_matrix(with_stderr_tail(
+                    format!("Failed to download {label}: exit code {code}"),
+                    &output,
+                ));
             }
             Err(e) => {
                 error!("failed to spawn yt-dlp for {label}: {e}");
@@ -639,27 +689,35 @@ fn spawn_aria2c(label: &'static str, url: String, download_dir: String, dest_dir
             }
         };
 
-        match Command::new("aria2c")
-            .arg("--dir")
-            .arg(&staging)
-            .arg("--continue=true")
-            .arg("--seed-time=60")
-            .arg(&url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
+        match run_command(
+            Command::new("aria2c")
+                .arg("--dir")
+                .arg(&staging)
+                .arg("--continue=true")
+                .arg("--seed-time=60")
+                .arg(&url),
+        )
+        .await
         {
-            Ok(status) if status.success() => {
+            Ok(output) if output.status.success() => {
                 finish_download(label, &url, &staging, &dest_dir).await;
             }
-            Ok(status) => {
+            Ok(output) => {
+                let code = output.status.code().map_or(-1, |c| c);
                 error!(
-                    "aria2c {label} failed (exit code {}): {url} (staging {staging})",
-                    status.code().map_or(-1, |c| c),
+                    "{}",
+                    with_stderr_tail(
+                        format!(
+                            "aria2c {label} failed (exit code {code}): {url} (staging {staging})"
+                        ),
+                        &output,
+                    )
                 );
 
-                post_to_matrix(format!("Failed to download {label} to {dest_dir}: exit code {}", status.code().map_or(-1, |c| c)));
+                post_to_matrix(with_stderr_tail(
+                    format!("Failed to download {label} to {dest_dir}: exit code {code}"),
+                    &output,
+                ));
             }
             Err(e) => {
                 error!("failed to spawn aria2c for {label}: {e}");
@@ -673,23 +731,28 @@ fn spawn_aria2c(label: &'static str, url: String, download_dir: String, dest_dir
 fn post_to_matrix(msg: String) {
     info!("posting to matrix: {msg}");
     tokio::spawn(async move {
-        match Command::new("/home/felix/.cargo/bin/t2")
-            .arg("pub")
-            .arg("string/matrix")
-            .arg(&msg)
-            .arg("tcp:10.0.0.2:9999")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
+        match run_command(
+            Command::new("/home/felix/.cargo/bin/t2")
+                .arg("pub")
+                .arg("string/matrix")
+                .arg(&msg)
+                .arg("tcp:10.0.0.2:9999"),
+        )
+        .await
         {
-            Ok(status) if status.success() => {
+            Ok(output) if output.status.success() => {
                 info!("matrix post completed successfully: {msg}");
             }
-            Ok(status) => {
+            Ok(output) => {
                 error!(
-                    "matrix post failed (exit code {}): {msg}",
-                    status.code().map_or(-1, |c| c),
+                    "{}",
+                    with_stderr_tail(
+                        format!(
+                            "matrix post failed (exit code {}): {msg}",
+                            output.status.code().map_or(-1, |c| c),
+                        ),
+                        &output,
+                    )
                 );
             }
             Err(e) => {
