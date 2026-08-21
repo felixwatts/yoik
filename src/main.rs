@@ -633,6 +633,7 @@ fn spawn_yt_dlp(
     dest_dir: String,
 ) {
     info!("spawning yt-dlp for {label}: {url}");
+    post_to_matrix(format!("Downloading {label} {url}..."));
     tokio::spawn(async move {
         let staging = match prepare_staging(&download_dir).await {
             Ok(s) => s,
@@ -679,6 +680,7 @@ fn spawn_yt_dlp(
 
 fn spawn_aria2c(label: &'static str, url: String, download_dir: String, dest_dir: String) {
     info!("spawning aria2c for {label}: {url}");
+    post_to_matrix(format!("Downloading {label} {url}..."));
     tokio::spawn(async move {
         let staging = match prepare_staging(&download_dir).await {
             Ok(s) => s,
