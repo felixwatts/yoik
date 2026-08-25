@@ -21,10 +21,11 @@ struct AppState {
     audiobook_dir: String,
     film_dir: String,
     series_dir: String,
+    kodi_jsonrpc_url: String,
     http: reqwest::Client,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum MediaKind {
     Music,
@@ -612,12 +613,70 @@ fn downloaded_name(names: &[String]) -> String {
     }
 }
 
-async fn finish_download(label: &'static str, url: &str, staging: &str, dest_dir: &str) {
+async fn refresh_kodi_library(state: &AppState, kind: MediaKind, dest_dir: &str) {
+    if state.kodi_jsonrpc_url.is_empty() {
+        return;
+    }
+
+    let method = if kind.is_audio() {
+        "AudioLibrary.Scan"
+    } else {
+        "VideoLibrary.Scan"
+    };
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": {
+            "directory": dest_dir,
+            "showdialogs": false,
+        },
+        "id": 1,
+    });
+
+    info!("refreshing kodi library via {method} ({dest_dir})");
+
+    match state
+        .http
+        .post(&state.kodi_jsonrpc_url)
+        .timeout(std::time::Duration::from_secs(10))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            match response.json::<serde_json::Value>().await {
+                Ok(body) if status.is_success() && body.get("error").is_none() => {
+                    info!("kodi {method} succeeded: {body}");
+                }
+                Ok(body) => {
+                    error!("kodi {method} failed (HTTP {status}): {body}");
+                }
+                Err(e) => {
+                    error!("kodi {method} failed to parse response (HTTP {status}): {e}");
+                }
+            }
+        }
+        Err(e) => {
+            error!("kodi {method} request failed: {e}");
+        }
+    }
+}
+
+async fn finish_download(
+    kind: MediaKind,
+    url: &str,
+    staging: &str,
+    dest_dir: &str,
+    state: &AppState,
+) {
+    let label = kind.label();
     match move_staging_to_dest(staging, dest_dir).await {
         Ok(names) => {
             let name = downloaded_name(&names);
             info!("{label} completed successfully: {name} ({url} -> {dest_dir})");
             post_to_matrix(format!("Downloaded {label}: {name}"));
+            refresh_kodi_library(state, kind, dest_dir).await;
         }
         Err(e) => {
             error!("{label} downloaded but failed to move from {staging} to {dest_dir}: {e}");
@@ -628,13 +687,10 @@ async fn finish_download(label: &'static str, url: &str, staging: &str, dest_dir
     }
 }
 
-fn spawn_yt_dlp(
-    label: &'static str,
-    url: String,
-    mut args: Vec<String>,
-    download_dir: String,
-    dest_dir: String,
-) {
+fn spawn_yt_dlp(kind: MediaKind, url: String, mut args: Vec<String>, state: AppState) {
+    let label = kind.label();
+    let dest_dir = kind.output_dir(&state).to_owned();
+    let download_dir = state.download_dir.clone();
     info!("spawning yt-dlp for {label}: {url}");
     post_to_matrix(format!("Downloading {label} {url}..."));
     tokio::spawn(async move {
@@ -653,7 +709,7 @@ fn spawn_yt_dlp(
 
         match run_command(Command::new("yt-dlp").args(&args)).await {
             Ok(output) if output.status.success() => {
-                finish_download(label, &url, &staging, &dest_dir).await;
+                finish_download(kind, &url, &staging, &dest_dir, &state).await;
             }
             Ok(output) => {
                 let code = output.status.code().map_or(-1, |c| c);
@@ -681,7 +737,10 @@ fn spawn_yt_dlp(
     });
 }
 
-fn spawn_aria2c(label: &'static str, url: String, download_dir: String, dest_dir: String) {
+fn spawn_aria2c(kind: MediaKind, url: String, state: AppState) {
+    let label = kind.label();
+    let dest_dir = kind.output_dir(&state).to_owned();
+    let download_dir = state.download_dir.clone();
     info!("spawning aria2c for {label}: {url}");
     post_to_matrix(format!("Downloading {label} {url}..."));
     tokio::spawn(async move {
@@ -705,7 +764,7 @@ fn spawn_aria2c(label: &'static str, url: String, download_dir: String, dest_dir
         .await
         {
             Ok(output) if output.status.success() => {
-                finish_download(label, &url, &staging, &dest_dir).await;
+                finish_download(kind, &url, &staging, &dest_dir, &state).await;
             }
             Ok(output) => {
                 let code = output.status.code().map_or(-1, |c| c);
@@ -778,13 +837,11 @@ async fn favicon() -> Response {
 
 async fn yoik(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redirect {
     let label = form.kind.label();
-    let dir = form.kind.output_dir(&state).to_owned();
-    let download_dir = state.download_dir.clone();
 
     if is_valid_youtube_url(&form.url) {
         if form.kind.is_audio() {
             spawn_yt_dlp(
-                label,
+                form.kind,
                 form.url,
                 vec![
                     "-x".into(),
@@ -792,12 +849,11 @@ async fn yoik(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redir
                     "mp3".into(),
                     "--no-playlist".into(),
                 ],
-                download_dir,
-                dir,
+                state,
             );
         } else {
             spawn_yt_dlp(
-                label,
+                form.kind,
                 form.url,
                 vec![
                     "-f".into(),
@@ -806,12 +862,11 @@ async fn yoik(State(state): State<AppState>, Form(form): Form<RipForm>) -> Redir
                     "mp4".into(),
                     "--no-playlist".into(),
                 ],
-                download_dir,
-                dir,
+                state,
             );
         }
     } else if is_aria2c_url(&form.url) {
-        spawn_aria2c(label, form.url, download_dir, dir);
+        spawn_aria2c(form.kind, form.url, state);
     } else {
         warn!("rejected unsupported URL for {label} rip: {:?}", form.url);
     }
@@ -840,12 +895,15 @@ async fn main() {
         .unwrap_or_else(|_| "/home/felix/data/video/films".into());
     let series_dir = std::env::var("YOIK_SERIES_DIR")
         .unwrap_or_else(|_| "/home/felix/data/video/series".into());
+    let kodi_jsonrpc_url = std::env::var("YOIK_KODI_JSONRPC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080/jsonrpc".into());
 
     info!("download dir:  {download_dir}");
     info!("music dir:     {music_dir}");
     info!("audiobook dir: {audiobook_dir}");
     info!("film dir:      {film_dir}");
     info!("series dir:    {series_dir}");
+    info!("kodi jsonrpc:  {kodi_jsonrpc_url}");
 
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
@@ -858,6 +916,7 @@ async fn main() {
         audiobook_dir,
         film_dir,
         series_dir,
+        kodi_jsonrpc_url,
         http,
     };
 
