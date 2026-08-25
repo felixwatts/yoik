@@ -919,9 +919,9 @@ async fn main() {
     let music_dir = std::env::var("YOIK_MUSIC_DIR")
         .unwrap_or_else(|_| "/home/felix/data/audio/music".into());
     let audiobook_dir = std::env::var("YOIK_AUDIOBOOK_DIR")
-        .unwrap_or_else(|_| "/home/felix/data/audio/audiobooks".into());
+        .unwrap_or_else(|_| "/home/felix/data/audio/audiobook".into());
     let film_dir = std::env::var("YOIK_FILM_DIR")
-        .unwrap_or_else(|_| "/home/felix/data/video/films".into());
+        .unwrap_or_else(|_| "/home/felix/data/video/film".into());
     let series_dir = std::env::var("YOIK_SERIES_DIR")
         .unwrap_or_else(|_| "/home/felix/data/video/series".into());
     let kodi_jsonrpc_addr = std::env::var("YOIK_KODI_JSONRPC_ADDR")
