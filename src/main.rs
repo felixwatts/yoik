@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -21,7 +22,7 @@ struct AppState {
     audiobook_dir: String,
     film_dir: String,
     series_dir: String,
-    kodi_jsonrpc_url: String,
+    kodi_jsonrpc_addr: String,
     http: reqwest::Client,
 }
 
@@ -613,8 +614,51 @@ fn downloaded_name(names: &[String]) -> String {
     }
 }
 
+async fn kodi_tcp_call(addr: &str, payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::to_vec(payload).map_err(|e| format!("serialize: {e}"))?;
+    body.push(b'\n');
+
+    let call = async {
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| format!("connect {addr}: {e}"))?;
+        stream
+            .write_all(&body)
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = stream
+                .read(&mut tmp)
+                .await
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("connection closed before response".into());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+
+            let mut de = serde_json::Deserializer::from_slice(&buf).into_iter::<serde_json::Value>();
+            loop {
+                match de.next() {
+                    Some(Ok(value)) if value.get("id").is_some() => return Ok(value),
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) if e.is_eof() => break,
+                    Some(Err(e)) => return Err(format!("parse: {e}")),
+                    None => break,
+                }
+            }
+        }
+    };
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), call)
+        .await
+        .map_err(|_| "timed out waiting for kodi".to_string())?
+}
+
 async fn refresh_kodi_library(state: &AppState, kind: MediaKind, dest_dir: &str) {
-    if state.kodi_jsonrpc_url.is_empty() {
+    if state.kodi_jsonrpc_addr.is_empty() {
         return;
     }
 
@@ -635,27 +679,12 @@ async fn refresh_kodi_library(state: &AppState, kind: MediaKind, dest_dir: &str)
 
     info!("refreshing kodi library via {method} ({dest_dir})");
 
-    match state
-        .http
-        .post(&state.kodi_jsonrpc_url)
-        .timeout(std::time::Duration::from_secs(10))
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            let status = response.status();
-            match response.json::<serde_json::Value>().await {
-                Ok(body) if status.is_success() && body.get("error").is_none() => {
-                    info!("kodi {method} succeeded: {body}");
-                }
-                Ok(body) => {
-                    error!("kodi {method} failed (HTTP {status}): {body}");
-                }
-                Err(e) => {
-                    error!("kodi {method} failed to parse response (HTTP {status}): {e}");
-                }
-            }
+    match kodi_tcp_call(&state.kodi_jsonrpc_addr, &payload).await {
+        Ok(body) if body.get("error").is_none() => {
+            info!("kodi {method} succeeded: {body}");
+        }
+        Ok(body) => {
+            error!("kodi {method} failed: {body}");
         }
         Err(e) => {
             error!("kodi {method} request failed: {e}");
@@ -895,15 +924,15 @@ async fn main() {
         .unwrap_or_else(|_| "/home/felix/data/video/films".into());
     let series_dir = std::env::var("YOIK_SERIES_DIR")
         .unwrap_or_else(|_| "/home/felix/data/video/series".into());
-    let kodi_jsonrpc_url = std::env::var("YOIK_KODI_JSONRPC_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080/jsonrpc".into());
+    let kodi_jsonrpc_addr = std::env::var("YOIK_KODI_JSONRPC_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9090".into());
 
     info!("download dir:  {download_dir}");
     info!("music dir:     {music_dir}");
     info!("audiobook dir: {audiobook_dir}");
     info!("film dir:      {film_dir}");
     info!("series dir:    {series_dir}");
-    info!("kodi jsonrpc:  {kodi_jsonrpc_url}");
+    info!("kodi jsonrpc:  {kodi_jsonrpc_addr}");
 
     let http = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
@@ -916,7 +945,7 @@ async fn main() {
         audiobook_dir,
         film_dir,
         series_dir,
-        kodi_jsonrpc_url,
+        kodi_jsonrpc_addr,
         http,
     };
 
