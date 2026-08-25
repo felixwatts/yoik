@@ -490,6 +490,9 @@ async fn search(State(state): State<AppState>, Query(query): Query<SearchQuery>)
             if torrent.id == "0" || torrent.info_hash.eq_ignore_ascii_case(DUMMY_INFO_HASH) {
                 return None;
             }
+            if torrent.name.to_ascii_lowercase().contains(".exe") {
+                return None;
+            }
             let seeders = torrent.seeders.parse::<u64>().unwrap_or(0);
             if seeders == 0 {
                 return None;
