@@ -376,6 +376,56 @@ fn is_aria2c_url(raw: &str) -> bool {
     matches!(parsed.scheme(), "http" | "https" | "ftp")
 }
 
+/// A short human-readable name for a download URL: the `dn` of a magnet link,
+/// the file name of an http/ftp URL, or the URL itself as a fallback.
+fn display_name(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let Ok(parsed) = url::Url::parse(trimmed) else {
+        return trimmed.to_owned();
+    };
+    if parsed.scheme().eq_ignore_ascii_case("magnet") {
+        let mut hash = None;
+        for (key, value) in parsed.query_pairs() {
+            match key.as_ref() {
+                "dn" if !value.trim().is_empty() => return value.trim().to_owned(),
+                "xt" => hash = value.rsplit(':').next().map(str::to_owned),
+                _ => {}
+            }
+        }
+        return match hash {
+            Some(h) => format!("torrent {h}"),
+            None => trimmed.to_owned(),
+        };
+    }
+    if matches!(parsed.scheme(), "http" | "https" | "ftp")
+        && let Some(segment) = parsed
+            .path_segments()
+            .and_then(|mut segs| segs.rfind(|s| !s.is_empty()))
+    {
+        return percent_decode(segment);
+    }
+    trimmed.to_owned()
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 const DUMMY_INFO_HASH: &str = "0000000000000000000000000000000000000000";
 
 const TRACKERS: &[&str] = &[
@@ -721,7 +771,7 @@ fn spawn_yt_dlp(kind: MediaKind, url: String, mut args: Vec<String>, state: AppS
     let dest_dir = kind.output_dir(&state).to_owned();
     let download_dir = state.download_dir.clone();
     info!("spawning yt-dlp for {label}: {url}");
-    post_to_matrix(format!("Downloading {label} {url}..."));
+    post_to_matrix(format!("Downloading {label}: {url}..."));
     tokio::spawn(async move {
         let staging = match prepare_staging(&download_dir).await {
             Ok(s) => s,
@@ -771,7 +821,7 @@ fn spawn_aria2c(kind: MediaKind, url: String, state: AppState) {
     let dest_dir = kind.output_dir(&state).to_owned();
     let download_dir = state.download_dir.clone();
     info!("spawning aria2c for {label}: {url}");
-    post_to_matrix(format!("Downloading {label} {url}..."));
+    post_to_matrix(format!("Downloading {label}: {}...", display_name(&url)));
     tokio::spawn(async move {
         let staging = match prepare_staging(&download_dir).await {
             Ok(s) => s,
@@ -960,4 +1010,34 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     info!("listening on http://{addr}");
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_name_magnet_uses_dn() {
+        let m = magnet_link("abc123", "Some Film (2020) 1080p");
+        assert_eq!(display_name(&m), "Some Film (2020) 1080p");
+    }
+
+    #[test]
+    fn display_name_magnet_without_dn_uses_hash() {
+        assert_eq!(display_name("magnet:?xt=urn:btih:abc123"), "torrent abc123");
+    }
+
+    #[test]
+    fn display_name_http_uses_file_name() {
+        assert_eq!(
+            display_name("https://example.com/files/My%20Album.zip?token=x"),
+            "My Album.zip"
+        );
+        assert_eq!(display_name("ftp://example.com/dir/sub/"), "sub");
+    }
+
+    #[test]
+    fn display_name_keeps_plus_in_paths() {
+        assert_eq!(display_name("https://example.com/a+b%2Bc.mkv"), "a+b+c.mkv");
+    }
 }
