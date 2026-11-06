@@ -877,7 +877,7 @@ fn post_to_matrix(msg: String) {
         match run_command(
             Command::new("/home/felix/.cargo/bin/t2")
                 .arg("pub")
-                .arg("string/matrix")
+                .arg("string:matrix")
                 .arg(&msg)
                 .arg("tcp:10.0.0.2:9999"),
         )
